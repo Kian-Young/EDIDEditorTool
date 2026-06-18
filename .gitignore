@@ -5,7 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+RTDTool.exe - 快捷方式.lnk
 # Distribution / packaging
 .Python
 build/

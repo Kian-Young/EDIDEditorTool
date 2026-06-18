@@ -500,7 +500,7 @@ class EDIDEditorApp:
         self.desc_edit_buttons: List[ttk.Button] = []
 
         for i in range(DESCRIPTOR_COUNT):
-            blk_frame = ttk.LabelFrame(frame, text=f"描述符块 {i + 1}  (Bytes {54 + i * 18}–{54 + i * 18 + 17})", padding=8)
+            blk_frame = ttk.LabelFrame(frame, text=f"描述符块 {i + 1}  (Bytes 0x{54 + i * 18:02X}–0x{54 + i * 18 + 17:02X})", padding=8)
             blk_frame.pack(fill=tk.X, pady=(0, 8))
             blk_frame.columnconfigure(0, weight=1)
 
@@ -973,7 +973,7 @@ class EDIDEditorApp:
             self.edid.edid_version = (self.ver_major.get(), self.ver_minor.get())
 
             # Input type
-            self.edid._data[20] = (self.edid._data[20] & 0x7F) | (0x80 if self.input_type_var.get() == "数字" else 0x00)
+            self.edid._blocks[0][20] = (self.edid._blocks[0][20] & 0x7F) | (0x80 if self.input_type_var.get() == "数字" else 0x00)
 
             # Screen size
             self.edid.screen_width_cm = self.scr_width_var.get()
@@ -1006,7 +1006,7 @@ class EDIDEditorApp:
         e = self.edid
         self.pnp_var.set(e.manufacturer_id)
         self.product_var.set(f"0x{e.product_code:04X}")
-        self.serial_num_var.set(str(e.serial_number))
+        self.serial_num_var.set(f"0x{e.serial_number:08X}")
         try:
             self.week_var.set(e.manufacture_week)
             self.year_var.set(e.manufacture_year)
