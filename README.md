@@ -1,0 +1,2 @@
+# EDIDEditorTool
+EasyToModifyEDID
