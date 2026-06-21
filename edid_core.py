@@ -490,6 +490,17 @@ class DataBlock:
             return SpeakerDataBlock.create(raw)
         if tag == CEA_DB_EXTENDED and len(raw) >= 1:
             ext_tag = raw[0]
+            # 路由到专门的扩展标签解析器
+            if ext_tag == CEA_EXT_HDR_STATIC:
+                return HDRStaticMetadataBlock.create(raw)
+            if ext_tag == CEA_EXT_COLORIMETRY:
+                return ColorimetryBlock.create(raw)
+            if ext_tag == CEA_EXT_YCBCR420_CAPMAP:
+                return YCbCr420CapMapBlock.create(raw)
+            if ext_tag == CEA_EXT_VIDEO_CAP:
+                return VideoCapabilityBlock.create(raw)
+            if ext_tag == CEA_EXT_YCBCR420_VIDEO:
+                return YCbCr420VideoBlock.create(raw)
             return DataBlock(tag=tag, ext_tag=ext_tag, raw_data=raw)
         return DataBlock(tag=tag, raw_data=raw)
 
@@ -571,27 +582,53 @@ class VendorDataBlock(DataBlock):
         parts = [self.vendor_name]
         if self.ieee_oui == HDMI_OUI and len(self.payload) >= 5:
             # HDMI 1.4 VSDB
-            src_phy = ['HDMI-A', 'HDMI-B'][self.payload[0] & 0x01] if self.payload[0] & 0x80 else 'DVI'
+            b0 = self.payload[0]
+            src_phy = 'HDMI-A' if (b0 & 0x80) else ('HDMI-B' if (b0 & 0x01) else 'DVI')
             max_tmds = "165MHz" if (self.payload[2] & 0x20) else "340MHz" if (self.payload[2] & 0x40) else "?"
             parts.append(f"物理接口={src_phy}, Max TMDS={max_tmds}")
-            if self.payload[0] & 0x20:
-                parts.append("支持 Deep Color 36bit")
-            if self.payload[0] & 0x40:
-                parts.append("支持 Deep Color 48bit")
+            if b0 & 0x20: parts.append("Deep Color 36bit")
+            if b0 & 0x40: parts.append("Deep Color 48bit")
+            if b0 & 0x10: parts.append("支持 AI (ACP/ISRC)")
             if len(self.payload) >= 6 and self.payload[4] & 0x04:
                 parts.append("3D 支持")
             if len(self.payload) >= 8 and self.payload[6] & 0x80:
-                parts.append("4K×2K 支持")
+                parts.append("4K×2K 支持 (HDMI 1.4b)")
         elif self.ieee_oui == 0xC45DD8 and len(self.payload) >= 1:
-            # HDMI Forum VSDB (HDMI 2.0)
+            # HDMI Forum VSDB (HDMI 2.0/2.1)
             ver = self.payload[0] & 0x07
-            parts.append(f"HDMI 2.{ver}")
+            ver_label = {0: "保留", 1: "HDMI 2.0", 2: "HDMI 2.1"}.get(ver, f"未知(ver={ver})")
+            parts.append(ver_label)
             if len(self.payload) >= 6:
-                max_tmds_ch = self.payload[4] & 0x7F
-                if max_tmds_ch:
-                    parts.append(f"Max TMDS Char Rate={max_tmds_ch * 5 + 300}MHz")
+                # Max TMDS Character Rate (5 Gc/s units + 300 Mcsc)
+                max_tmds = self.payload[4] & 0x7F
+                if max_tmds:
+                    val = max_tmds * 5 + 300
+                    parts.append(f"Max TMDS={val}Mcsc")
+                # SCDC present
+                if self.payload[5] & 0x08:
+                    parts.append("SCDC 支持")
+                # Scrambling < 340 Mcsc
                 if self.payload[5] & 0x02:
-                    parts.append("HDR 支持")
+                    parts.append("LTE 340Mcsc Scramble")
+                # HDR
+                if self.payload[5] & 0x04:
+                    parts.append("HDR 支持 (HDMI 2.0a/b)")
+                # Max FRL Rate (HDMI 2.1)
+                if len(self.payload) >= 7:
+                    max_frl = (self.payload[6] >> 4) & 0x0F
+                    frl_rates = {0: "无FRL", 1: "3 Gbps×3 (9G)", 2: "6 Gbps×3 (18G)",
+                                 3: "6 Gbps×4 (24G)", 4: "8 Gbps×4 (32G)",
+                                 5: "10 Gbps×4 (40G)", 6: "12 Gbps×4 (48G)"}
+                    if max_frl:
+                        parts.append(f"FRL={frl_rates.get(max_frl, f'{max_frl}')}")
+                    # DSC support
+                    if self.payload[6] & 0x08:
+                        parts.append("DSC 支持")
+                # DSC Max FRL Rate
+                if len(self.payload) >= 8 and self.payload[6] & 0x08:
+                    dsc_max_frl = self.payload[7] & 0x0F
+                    if dsc_max_frl:
+                        parts.append(f"DSC FRL={dsc_max_frl}")
         return " | ".join(parts)
 
 
@@ -621,6 +658,152 @@ class SpeakerDataBlock(DataBlock):
             if self.allocation & (1 << bit):
                 parts.append(name)
         return ", ".join(parts) if parts else f"0x{self.allocation:06X}"
+
+
+# ── 扩展标签数据块 ─────────────────────────────────────────────────────
+class VideoCapabilityBlock(DataBlock):
+    """视频能力数据块 (ext tag 0) — 每个字节按 CEA-861 定义"""
+    def __init__(self, raw: bytes = b''):
+        super().__init__(tag=CEA_DB_EXTENDED, ext_tag=CEA_EXT_VIDEO_CAP, raw_data=raw)
+        self.selectable_ycc_quant = bool(raw[1] & 0x40) if len(raw) > 1 else False
+        self.selectable_rgb_quant = bool(raw[1] & 0x80) if len(raw) > 1 else False
+        self.pt_overscan = bool(raw[1] & 0x20) if len(raw) > 1 else False
+        self.it_overscan = bool(raw[1] & 0x10) if len(raw) > 1 else False
+        self.ce_overscan = bool(raw[1] & 0x08) if len(raw) > 1 else False
+
+    @classmethod
+    def create(cls, raw: bytes) -> 'VideoCapabilityBlock':
+        return cls(raw)
+
+    @property
+    def summary(self) -> str:
+        parts = []
+        if self.selectable_rgb_quant: parts.append("可选RGB量化范围")
+        if self.selectable_ycc_quant: parts.append("可选YCC量化范围")
+        if self.pt_overscan: parts.append("PT过扫描")
+        if self.it_overscan: parts.append("IT过扫描")
+        if self.ce_overscan: parts.append("CE过扫描")
+        return ", ".join(parts) if parts else "无特殊能力"
+
+
+class ColorimetryBlock(DataBlock):
+    """色彩学数据块 (ext tag 5)"""
+    COLORIMETRY = {   # byte 2 bitmask
+        0: "BT.2020 YCC", 1: "BT.2020 RGB", 2: "BT.2020 cRGB",
+        3: "DCI-P3 (ST 428)", 4: "xvYCC709", 5: "xvYCC601",
+        6: "sYCC601", 7: "Adobe YCC601", 8: "Adobe RGB (OP)",
+        9: "BT.2020 CYCC",
+    }
+
+    def __init__(self, raw: bytes = b''):
+        super().__init__(tag=CEA_DB_EXTENDED, ext_tag=CEA_EXT_COLORIMETRY, raw_data=raw)
+
+    @classmethod
+    def create(cls, raw: bytes) -> 'ColorimetryBlock':
+        return cls(raw)
+
+    @property
+    def supported(self) -> List[str]:
+        if len(self.raw_data) < 3:
+            return []
+        bm = self.raw_data[2]
+        result = []
+        for bit, name in self.COLORIMETRY.items():
+            if bm & (1 << bit):
+                result.append(name)
+        return result
+
+    @property
+    def summary(self) -> str:
+        s = self.supported
+        return "支持: " + (", ".join(s) if s else "无额外色彩学")
+
+
+class HDRStaticMetadataBlock(DataBlock):
+    """HDR 静态元数据数据块 (ext tag 6)"""
+    EOTF_NAMES = {0: "传统 Gamma (SDR)", 1: "SMPTE ST 2084 (PQ)", 2: "HLG (Hybrid Log-Gamma)"}
+
+    def __init__(self, raw: bytes = b''):
+        super().__init__(tag=CEA_DB_EXTENDED, ext_tag=CEA_EXT_HDR_STATIC, raw_data=raw)
+        self.eotfs: List[int] = []  # supported EOTF list
+        self.sdr_eotf: int = 0
+        self.descriptor_types: List[int] = []
+        if len(raw) >= 3:
+            self.sdr_eotf = raw[1]
+            eotf_bm = raw[2]
+            for bit in range(8):
+                if eotf_bm & (1 << bit):
+                    self.eotfs.append(bit)
+        # 解析 Static Metadata Descriptor Type 1
+        if len(raw) >= 4:
+            pos = 3
+            while pos < len(raw):
+                dtype = raw[pos]
+                if dtype == 0:
+                    break
+                dlen = raw[pos + 1] if pos + 1 < len(raw) else 0
+                self.descriptor_types.append(dtype)
+                pos += 2 + dlen
+
+    @classmethod
+    def create(cls, raw: bytes) -> 'HDRStaticMetadataBlock':
+        return cls(raw)
+
+    @property
+    def summary(self) -> str:
+        parts = []
+        if self.eotfs:
+            eotf_names = [self.EOTF_NAMES.get(e, f"EOTF {e}") for e in self.eotfs]
+            parts.append("HDR EOTF: " + ", ".join(eotf_names))
+        if self.descriptor_types:
+            parts.append(f"描述符类型: {self.descriptor_types}")
+        sdr = self.EOTF_NAMES.get(self.sdr_eotf, f"Type {self.sdr_eotf}")
+        parts.append(f"SDR={sdr}")
+        return " | ".join(parts) if parts else "HDR 静态元数据"
+
+
+class YCbCr420CapMapBlock(DataBlock):
+    """YCbCr 4:2:0 能力映射数据块 (ext tag 15)"""
+    def __init__(self, raw: bytes = b''):
+        super().__init__(tag=CEA_DB_EXTENDED, ext_tag=CEA_EXT_YCBCR420_CAPMAP, raw_data=raw)
+
+    @classmethod
+    def create(cls, raw: bytes) -> 'YCbCr420CapMapBlock':
+        return cls(raw)
+
+    @property
+    def summary(self) -> str:
+        if len(self.raw_data) < 2:
+            return "YCbCr 4:2:0 能力映射"
+        # raw_data[1:] 是支持的 SVD 索引位掩码
+        supported_svds = []
+        for i in range(1, len(self.raw_data)):
+            for bit in range(8):
+                if self.raw_data[i] & (1 << bit):
+                    svd_idx = (i - 1) * 8 + bit
+                    supported_svds.append(str(svd_idx))
+        return f"YCbCr 4:2:0 支持 {len(supported_svds)} 个 VIC" + (f" (索引: {', '.join(supported_svds[:10])}{'...' if len(supported_svds) > 10 else ''})" if supported_svds else "")
+
+
+class YCbCr420VideoBlock(DataBlock):
+    """YCbCr 4:2:0 视频数据块 (ext tag 14) — 列出仅 4:2:0 下支持的 VIC"""
+    def __init__(self, raw: bytes = b''):
+        super().__init__(tag=CEA_DB_EXTENDED, ext_tag=CEA_EXT_YCBCR420_VIDEO, raw_data=raw)
+
+    @classmethod
+    def create(cls, raw: bytes) -> 'YCbCr420VideoBlock':
+        return cls(raw)
+
+    @property
+    def summary(self) -> str:
+        if len(self.raw_data) < 2:
+            return "YCbCr 4:2:0 视频"
+        vics = []
+        for i in range(1, len(self.raw_data)):
+            vic = self.raw_data[i] & 0x7F
+            desc = VIC_TABLE.get(vic, f"VIC {vic}")
+            vics.append(desc)
+        return "YCbCr 4:2:0 视频: " + (" | ".join(vics[:8]) + ("..." if len(vics) > 8 else "") if vics else "空")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -816,6 +999,300 @@ class CEA861Extension:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# DisplayID 扩展块 (tag 0x70) — VESA 新一代显示器识别标准
+# ═══════════════════════════════════════════════════════════════════════════
+
+# DisplayID Data Block 标签
+DID_DB_PRODUCT_ID = 0x01       # 产品标识
+DID_DB_DISPLAY_PARAM = 0x02    # 显示参数
+DID_DB_TIMING_TYPE_I = 0x03    # Type I 详细时序 (20字节载荷)
+DID_DB_TIMING_TYPE_II = 0x04   # Type II 详细时序
+DID_DB_TIMING_TYPE_III = 0x05  # Type III 详细时序 (包含像素格式)
+DID_DB_TIMING_TYPE_IV = 0x06   # Type IV 详细时序
+DID_DB_TIMING_TYPE_V = 0x07    # Type V 详细时序 (立体)
+DID_DB_TIMING_TYPE_VI = 0x08   # Type VI 详细时序
+DID_DB_TIMING_TYPE_VII = 0x0D  # Type VII 详细时序
+DID_DB_TIMING_TYPE_VIII = 0x0E # Type VIII 详细时序
+DID_DB_TILED_DISPLAY = 0x09    # 拼接显示拓扑
+DID_DB_DISPLAY_DEVICE = 0x0A   # 显示设备
+DID_DB_INTERFACE_POWER = 0x0B  # 接口电源序列
+DID_DB_TRANSFER_CHAR = 0x0C    # 传输特性 (Gamma/EOTF)
+DID_DB_STEREO = 0x0F           # 立体显示接口
+DID_DB_DYNAMIC_RANGE = 0x10    # 动态视频时序范围限制
+DID_DB_CONTAINER_ID = 0x21     # 容器 ID (UUID)
+DID_DB_VENDOR_SPECIFIC = 0x22  # 厂商特定
+DID_DB_PRODUCT_ID_EXT = 0x23   # 产品标识扩展
+DID_DB_ADAPTIVE_SYNC = 0x24    # Adaptive Sync (FreeSync/G-Sync)
+DID_DB_HDR_STATIC = 0x25       # HDR 静态元数据 (DisplayID 版)
+DID_DB_BLOCK_MAP = 0x7F        # 块映射
+
+DID_TAG_NAMES = {
+    0x01: "产品标识 (Product ID)", 0x02: "显示参数 (Display Parameters)",
+    0x03: "Type I 详细时序", 0x04: "Type II 详细时序",
+    0x05: "Type III 详细时序", 0x06: "Type IV 详细时序",
+    0x07: "Type V 详细时序", 0x08: "Type VI 详细时序",
+    0x09: "拼接显示拓扑 (Tiled)", 0x0A: "显示设备 (Display Device)",
+    0x0B: "接口电源序列", 0x0C: "传输特性 (Transfer Char)",
+    0x0D: "Type VII 详细时序", 0x0E: "Type VIII 详细时序",
+    0x0F: "立体显示接口", 0x10: "动态时序范围",
+    0x21: "容器 ID (UUID)", 0x22: "厂商特定 (Vendor)",
+    0x23: "产品标识扩展", 0x24: "Adaptive Sync (FreeSync/G-Sync)",
+    0x25: "HDR 静态元数据", 0x7F: "块映射 (Block Map)",
+}
+
+DID_TIMING_TAGS = {0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0D, 0x0E}
+
+
+@dataclass
+class DisplayIDDataBlock:
+    """DisplayID 数据块 (变长, 最少2字节头部)"""
+    tag: int = 0
+    revision: int = 0
+    payload: bytes = field(default_factory=bytes)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'DisplayIDDataBlock':
+        tag = data[0]
+        rev = (data[1] >> 5) & 0x07
+        length = data[1] & 0x1F  # 载荷字节数
+        payload = bytes(data[2:2 + length]) if length > 0 else b''
+        return cls(tag=tag, revision=rev, payload=payload)
+
+    @property
+    def tag_name(self) -> str:
+        return DID_TAG_NAMES.get(self.tag, f"未知标签 (0x{self.tag:02X})")
+
+    @property
+    def is_timing(self) -> bool:
+        return self.tag in DID_TIMING_TAGS
+
+    @property
+    def summary(self) -> str:
+        """子类覆盖以提供更详细信息"""
+        if self.is_timing:
+            t = self.parse_timing()
+            if t:
+                return (f"{t.h_active}×{t.v_active} @ {t.refresh_rate:.1f}Hz "
+                        f"({t.pixel_clock_mhz:.1f}MHz)")
+            return f"{self.tag_name} ({len(self.payload)} 字节)"
+        if self.tag == DID_DB_PRODUCT_ID:
+            return self._parse_product_id()
+        if self.tag == DID_DB_ADAPTIVE_SYNC:
+            return self._parse_adaptive_sync()
+        if self.tag == DID_DB_TILED_DISPLAY:
+            return f"拼接显示 ({len(self.payload)} 字节)"
+        return f"{len(self.payload)} 字节"
+
+    def parse_timing(self) -> Optional[DetailedTiming]:
+        """尝试解析 DisplayID 详细时序为通用的 DetailedTiming 对象"""
+        if len(self.payload) < 20:
+            return None
+        p = self.payload
+        # Pixel Clock: bytes 0-3, little-endian uint32
+        # DisplayID 1.2: 10kHz 单位; DisplayID 1.3: Hz 单位
+        # 我们通过数值大小判断：> 100000 则可能是 Hz，转换为 10kHz
+        pclk_raw = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)
+        if pclk_raw > 500000:  # 超过 5GHz → 可能是 Hz 单位
+            pclk = pclk_raw // 10000
+        else:
+            pclk = pclk_raw
+
+        # H Active: bytes 4-5, little-endian uint16
+        ha = p[4] | (p[5] << 8)
+
+        # H Blank: byte 6 (low 8 bits) + byte 7 bits [3:0] (high 4 bits)
+        hb = p[6] | ((p[7] & 0x0F) << 8)
+
+        # H Front Porch (sync offset): byte 8 [7:0] low + byte 7 bits [7:4] high nibble
+        hfp = p[8] | (((p[7] >> 4) & 0x0F) << 8)
+
+        # H Sync Width: byte 9
+        hs = p[9]
+
+        # V Active: bytes 10-11, little-endian uint16
+        va = p[10] | (p[11] << 8)
+
+        # V Blank: byte 12 low + byte 13 bits [3:0] high nibble
+        vb = p[12] | ((p[13] & 0x0F) << 8)
+
+        # V Front Porch: byte 14 [7:0] low + byte 13 bits [7:4] high nibble
+        vfp = p[14] | (((p[13] >> 4) & 0x0F) << 8)
+
+        # V Sync Width: byte 15
+        vs = p[15]
+
+        # Image Size: bytes 16-17 (H), bytes 18-19 (V), mm
+        hsz = p[16] | (p[17] << 8)
+        vsz = p[18] | (p[19] << 8)
+
+        return DetailedTiming(
+            pixel_clock=pclk, h_active=ha, h_blanking=hb,
+            v_active=va, v_blanking=vb,
+            h_front_porch=hfp, h_sync=hs,
+            v_front_porch=vfp, v_sync=vs,
+            h_image_size=hsz, v_image_size=vsz,
+        )
+
+    def _parse_product_id(self) -> str:
+        """解析产品标识数据块"""
+        if len(self.payload) < 12:
+            return f"产品标识 ({len(self.payload)} 字节)"
+        p = self.payload
+        # Byte 0-1: Manufacturer PnP ID (同 EDID 编码)
+        l1 = (p[0] >> 2) & 0x1F
+        l2 = ((p[0] & 0x03) << 3) | ((p[1] >> 5) & 0x07)
+        l3 = p[1] & 0x1F
+        try:
+            mfr = chr(l1 + ord('A') - 1) + chr(l2 + ord('A') - 1) + chr(l3 + ord('A') - 1)
+        except ValueError:
+            mfr = "???"
+        # Byte 2-3: Product Code (LE)
+        prod = p[2] | (p[3] << 8)
+        # Byte 4-7: Serial Number (LE)
+        sn = p[4] | (p[5] << 8) | (p[6] << 16) | (p[7] << 24)
+        # Byte 8: Week, Byte 9: Year
+        week = p[8] if len(p) > 8 else 0
+        year = (p[9] + 2000) if len(p) > 9 else 0
+        # Byte 10+: Model tag / name string
+        model_str = ""
+        if len(p) > 10:
+            try:
+                model_str = p[10:].decode('ascii', errors='replace').rstrip('\x00\n ')
+            except Exception:
+                pass
+        parts = [f"Mfr={mfr}", f"Prod=0x{prod:04X}", f"SN=0x{sn:08X}"]
+        if week and year:
+            parts.append(f"Date={year}W{week}")
+        if model_str:
+            parts.append(f'Model="{model_str}"')
+        return " | ".join(parts)
+
+    def _parse_adaptive_sync(self) -> str:
+        """解析 Adaptive Sync 数据块"""
+        if len(self.payload) < 2:
+            return "Adaptive Sync"
+        p = self.payload
+        # Byte 0: Max refresh (Hz), Byte 1: Min refresh (Hz)
+        max_rr = p[0] if p[0] else 0
+        min_rr = p[1] if len(p) > 1 else 0
+        if min_rr and max_rr:
+            return f"Adaptive Sync: {min_rr}-{max_rr} Hz"
+        return f"Adaptive Sync ({len(self.payload)} 字节)"
+
+
+@dataclass
+class DisplayIDExtension:
+    """DisplayID 扩展块 (tag 0x70, 128 字节)
+
+    结构:
+      Byte 0:      标签 (0x70)
+      Byte 1:      版本号 (如 0x13 = 1.3)
+      Byte 2:      数据块数量
+      Bytes 3-4:   保留
+      Bytes 5+:    DisplayID Data Blocks (变长序列)
+      Byte 127:    校验和
+    """
+    revision: int = 0x13
+    data_blocks: List[DisplayIDDataBlock] = field(default_factory=list)
+    _raw: bytes = field(default_factory=bytes)
+    _vendor_raw_start: int = 0  # 非标准数据起始字节位置
+
+    @property
+    def timings(self) -> List[Tuple[DisplayIDDataBlock, DetailedTiming]]:
+        """提取所有 DisplayID 详细时序"""
+        result = []
+        for db in self.data_blocks:
+            if db.is_timing:
+                t = db.parse_timing()
+                if t:
+                    result.append((db, t))
+        return result
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> Optional['DisplayIDExtension']:
+        if len(data) < 128 or data[0] != DISPLAYID_TAG:
+            return None
+        rev = data[1]
+        ext = cls(revision=rev, _raw=data)
+
+        # DisplayID 版本决定 data block 起始偏移
+        # 1.3+: 从 byte 5 开始
+        # 1.2:  从 byte 3 开始 (byte 2 = section length / flags)
+        if rev >= 0x13:
+            pos = 5
+        else:
+            pos = 3  # DisplayID 1.2 and earlier
+
+        parsed_count = 0
+        while pos < 126:
+            if pos + 2 > 126:
+                break
+            tag = data[pos]
+            byte1 = data[pos + 1]
+            length = byte1 & 0x1F
+            # 合法性检查：非标准 tag 或异常长度 → 可能是 vendor 自定义数据，停止解析
+            if tag > 0x7F or (tag == 0 and length == 0):
+                break
+            if tag < 0x01 or (tag > 0x25 and tag < 0x7F and tag not in {0x7F}):
+                break  # 未知标签范围 → 非标准数据
+            end = pos + 2 + length
+            if end > 127:
+                end = 127
+            chunk = bytes(data[pos:end])
+            try:
+                db = DisplayIDDataBlock.from_bytes(chunk)
+                # 过滤无效数据块：时序类型必须有足够载荷
+                if not (db.tag in DID_TIMING_TAGS and len(db.payload) < 1):
+                    ext.data_blocks.append(db)
+                    parsed_count += 1
+            except Exception:
+                break
+            pos = end
+            if parsed_count > 32:  # 安全上限
+                break
+
+        # 剩余数据作为 raw vendor data
+        ext._vendor_raw_start = pos
+        return ext
+
+    def to_bytes(self) -> bytes:
+        """序列化为 128 字节"""
+        buf = bytearray(128)
+        buf[0] = DISPLAYID_TAG
+        buf[1] = self.revision
+        buf[2] = len(self.data_blocks) & 0xFF
+        pos = 5
+        for db in self.data_blocks:
+            size = 2 + len(db.payload)
+            if pos + size > 127:
+                break
+            buf[pos] = db.tag
+            buf[pos + 1] = ((db.revision & 0x07) << 5) | (len(db.payload) & 0x1F)
+            buf[pos + 2:pos + size] = db.payload
+            pos += size
+        buf[127] = (256 - sum(buf[:127])) % 256
+        return bytes(buf)
+
+    @property
+    def vendor_raw(self) -> bytes:
+        """返回未解析的 vendor 自定义数据"""
+        if self._vendor_raw_start > 0 and len(self._raw) > self._vendor_raw_start:
+            return self._raw[self._vendor_raw_start:127]
+        return b''
+
+    def is_checksum_valid(self) -> bool:
+        return sum(self._raw[:128]) % 256 == 0 if len(self._raw) >= 128 else False
+
+    @property
+    def summary(self) -> str:
+        timing_count = sum(1 for db in self.data_blocks if db.is_timing)
+        parts = [f"DisplayID 1.{self.revision >> 4}{(self.revision & 0x0F)}",
+                 f"{len(self.data_blocks)} 个数据块",
+                 f"{timing_count} 个详细时序"]
+        return " | ".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # EDID 主类 — 支持 128/256/384 字节
 # ═══════════════════════════════════════════════════════════════════════════
 class EDID:
@@ -851,6 +1328,9 @@ class EDID:
         self._descriptors: List[DescriptorBlock] = []
         self._parse_descriptors()
         self._cea_ext: Optional[CEA861Extension] = None
+        self._cea_ext2: Optional[CEA861Extension] = None  # Block 2
+        self._ext2_tag: int = 0  # Block 2 的原始标签
+        self._displayid_ext: Optional[DisplayIDExtension] = None  # Block 1 或 2 的 DisplayID
         self._parse_extensions()
 
     # ── 块管理 ──────────────────────────────────────────────────────────
@@ -885,32 +1365,89 @@ class EDID:
 
     # ── 扩展块解析 ──────────────────────────────────────────────────────
     def _parse_extensions(self):
-        """解析所有扩展块"""
+        """解析所有扩展块 (Block 1 & Block 2)"""
         self._cea_ext = None
+        self._cea_ext2 = None
+        self._displayid_ext = None
+        self._ext2_tag = 0
         for i in range(1, len(self._blocks)):
             tag = self._blocks[i][0]
             if tag == CEA_TAG:
                 ext = CEA861Extension.from_bytes(bytes(self._blocks[i]))
                 if ext:
-                    self._cea_ext = ext  # 取第一个 CEA 扩展
-            # 后续可扩展 DisplayID / Block Map 解析
+                    if self._cea_ext is None:
+                        self._cea_ext = ext
+                    else:
+                        self._cea_ext2 = ext
+            elif tag == DISPLAYID_TAG:
+                ext = DisplayIDExtension.from_bytes(bytes(self._blocks[i]))
+                if ext:
+                    self._displayid_ext = ext
+            elif i == 2:
+                self._ext2_tag = tag
 
     def _sync_extensions(self):
-        """将 CEA 扩展序列化回底层数据"""
+        """将扩展块序列化回底层数据"""
+        # Block 1
         if self._cea_ext and len(self._blocks) >= 2:
             self._blocks[1] = bytearray(self._cea_ext.to_bytes())
-        elif self._cea_ext and len(self._blocks) < 2:
-            # 自动添加一个扩展块
-            self._blocks.append(bytearray(self._cea_ext.to_bytes()))
+        elif self._displayid_ext and len(self._blocks) >= 2:
+            self._blocks[1] = bytearray(self._displayid_ext.to_bytes())
+        elif (self._cea_ext or self._displayid_ext) and len(self._blocks) < 2:
+            ext_data = self._cea_ext.to_bytes() if self._cea_ext else self._displayid_ext.to_bytes()
+            self._blocks.append(bytearray(ext_data))
+            self._blocks[0][126] = len(self._blocks) - 1
+
+        # Block 2
+        if self._cea_ext2 and len(self._blocks) >= 3:
+            self._blocks[2] = bytearray(self._cea_ext2.to_bytes())
+        elif self._displayid_ext and len(self._blocks) >= 3 and self._blocks[2][0] != DISPLAYID_TAG:
+            self._blocks[2] = bytearray(self._displayid_ext.to_bytes())
+        elif self._cea_ext2 and len(self._blocks) < 3:
+            self._blocks.append(bytearray(self._cea_ext2.to_bytes()))
             self._blocks[0][126] = len(self._blocks) - 1
 
     @property
     def cea_extension(self) -> Optional[CEA861Extension]:
-        """CEA-861 扩展块 (首个)"""
+        """CEA-861 扩展块 (Block 1)"""
         return self._cea_ext
 
+    @property
+    def cea_extension2(self) -> Optional[CEA861Extension]:
+        """CEA-861 扩展块 (Block 2)"""
+        return self._cea_ext2
+
+    @property
+    def displayid_extension(self) -> Optional[DisplayIDExtension]:
+        """DisplayID 扩展块"""
+        return self._displayid_ext
+
+    @property
+    def ext2_info(self) -> dict:
+        """Block 2 扩展块信息（含 CEA-861 或 DisplayID）"""
+        if len(self._blocks) < 3:
+            return {'exists': False}
+        tag = self._blocks[2][0]
+        tag_names = {
+            0x02: 'CEA-861 Extension',
+            0x70: 'DisplayID Extension',
+            0xF0: 'Block Map',
+            0x50: 'Localized String Extension (多语言)',
+            0x10: 'VTB-EXT (Video Timing Block)',
+        }
+        parsed = (self._cea_ext2 is not None) or (self._displayid_ext is not None and tag == DISPLAYID_TAG)
+        return {
+            'exists': True,
+            'tag': tag,
+            'tag_name': tag_names.get(tag, f'未知标签 (0x{tag:02X})'),
+            'parsed': parsed,
+            'ceadata': self._cea_ext2,
+            'displayid': self._displayid_ext if tag == DISPLAYID_TAG else None,
+            'raw': bytes(self._blocks[2]),
+        }
+
     def ensure_cea(self) -> CEA861Extension:
-        """确保存在 CEA-861 扩展块，如没有则自动创建"""
+        """确保存在 CEA-861 扩展块"""
         if self._cea_ext is None:
             self._cea_ext = CEA861Extension.create_minimal()
             if len(self._blocks) < 2:
@@ -919,9 +1456,19 @@ class EDID:
             self._sync_extensions()
         return self._cea_ext
 
+    def ensure_cea2(self) -> CEA861Extension:
+        """确保 Block 2 存在 CEA-861 扩展"""
+        if self._cea_ext2 is None:
+            self._cea_ext2 = CEA861Extension.create_minimal()
+            if len(self._blocks) < 3:
+                self.set_blocks(3)
+            self._ext2_tag = CEA_TAG
+            self._sync_extensions()
+        return self._cea_ext2
+
     @property
     def all_dtds(self) -> List[Tuple[int, DetailedTiming]]:
-        """获取所有 DTD (基础 + CEA 扩展) → [(block_index, timing), ...]"""
+        """获取所有 DTD (基础 + CEA 扩展 + DisplayID) → [(block_index, timing), ...]"""
         dtds = []
         for b in self._descriptors:
             if b.is_timing and b.timing:
@@ -929,6 +1476,13 @@ class EDID:
         if self._cea_ext:
             for dt in self._cea_ext.dtds:
                 dtds.append((1, dt))
+        if self._cea_ext2:
+            for dt in self._cea_ext2.dtds:
+                dtds.append((2, dt))
+        # DisplayID timings
+        if self._displayid_ext:
+            for db, dt in self._displayid_ext.timings:
+                dtds.append((2 if len(self._blocks) > 2 else 1, dt))
         return dtds
 
     # ── 描述符解析 ──────────────────────────────────────────────────────
@@ -1212,7 +1766,10 @@ class EDID:
         if self._cea_ext:
             self._sync_extensions()
             self.update_checksum(1)
-        if len(self._blocks) >= 3:
+        if self._cea_ext2:
+            self._sync_extensions()
+            self.update_checksum(2)
+        elif len(self._blocks) >= 3:
             self.update_checksum(2)
         self._blocks[0][126] = len(self._blocks) - 1
         result = bytearray()

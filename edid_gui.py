@@ -24,7 +24,8 @@ from edid_core import (
     TIMING_PRESETS, KNOWN_VENDORS, DESCRIPTOR_COUNT, DescriptorTag,
     CEA861Extension, ShortVideoDescriptor, AudioFormat,
     DataBlock, AudioDataBlock, VideoDataBlock, VendorDataBlock, SpeakerDataBlock,
-    VIC_TABLE, analyze_rtd_file, find_edid_in_file, EDID_BLOCK_SIZE
+    VIC_TABLE, analyze_rtd_file, find_edid_in_file, EDID_BLOCK_SIZE,
+    DisplayIDExtension, DisplayIDDataBlock, DID_TAG_NAMES, DID_TIMING_TAGS
 )
 
 
@@ -712,6 +713,20 @@ class EDIDEditorApp:
 
         ttk.Button(sec6, text="添加 CEA DTD...", command=self._add_cea_dtd).pack(side=tk.LEFT, padx=5)
 
+        # ── DisplayID 详细时序 ──
+        sec7 = Section(scroll_frame, "DisplayID 详细时序 (可编辑)")
+        sec7.pack(fill=tk.X, pady=(0, SECTION_PAD))
+
+        self.did_timing_frame = ttk.Frame(sec7)
+        self.did_timing_frame.pack(fill=tk.X)
+
+        did_btn_frame = ttk.Frame(sec7)
+        did_btn_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(did_btn_frame, text="添加 DisplayID 时序...", command=self._add_did_timing).pack(side=tk.LEFT, padx=3)
+        ttk.Button(did_btn_frame, text="添加 DisplayID 时序到 Block 2...",
+                   command=lambda: self._add_did_timing(block2=True)).pack(side=tk.LEFT, padx=3)
+        ttk.Button(did_btn_frame, text="刷新 DisplayID 时序列表", command=self._refresh_did_timing_display).pack(side=tk.LEFT, padx=3)
+
         # ── 按钮 ──
         btn_frame = ttk.Frame(scroll_frame)
         btn_frame.pack(fill=tk.X, pady=10)
@@ -1370,10 +1385,51 @@ class EDIDEditorApp:
                 marker = markers_0.get(block_offset, "")
                 if marker:
                     marker = f"  {marker}"
-            elif block_num == 1 and block_offset == 0:
-                marker = "  ← CEA-861 Extension (Block 1)"
-            elif block_num == 2 and block_offset == 0:
-                marker = "  ← Extension Block 2"
+            elif block_num == 1:
+                # Block 1 markers (CEA-861)
+                if block_offset == 0:
+                    cea1 = self.edid.cea_extension
+                    dtd_count = len(cea1.dtds) if cea1 else 0
+                    marker = f"  ← CEA-861 Block 1 (tag=0x{data[128]:02X}, rev={data[129]}, {len(cea1.data_blocks) if cea1 else 0} data blocks, {dtd_count} DTDs)"
+                elif block_offset == 4 and cea1:
+                    marker = f"  ← Data Block Collection (offset 4, end at {cea1.dtd_offset})"
+                elif block_offset * 16 >= cea1.dtd_offset if cea1 else False:
+                    marker = "  ← CEA DTD area"
+            elif block_num == 2:
+                # Block 2 markers
+                info = self.edid.ext2_info
+                did = info.get('displayid')
+                if block_offset == 0:
+                    if did is not None:
+                        t_count = sum(1 for db in did.data_blocks if db.is_timing)
+                        marker = f"  ← DisplayID Block 2 (v1.{did.revision>>4}{did.revision&0xF}, {len(did.data_blocks)} data blocks, {t_count} timings)"
+                    elif info.get('parsed') and info.get('ceadata'):
+                        cea2 = info['ceadata']
+                        dtd_count = len(cea2.dtds) if cea2 else 0
+                        marker = f"  ← CEA-861 Block 2 (tag=0x{data[256]:02X}, rev={data[257]}, {len(cea2.data_blocks) if cea2 else 0} data blocks, {dtd_count} DTDs)"
+                    else:
+                        marker = f"  ← Block 2: {info.get('tag_name', 'Unknown')} (tag=0x{info.get('tag', 0):02X})"
+                elif did is not None:
+                    # Show DisplayID data block boundaries
+                    pos_in_blk = 5  # First data block starts at byte 5
+                    for j, db in enumerate(did.data_blocks):
+                        db_size = 2 + len(db.payload)
+                        if pos_in_blk // 16 == block_offset:
+                            marker = f"  ← DB#{j}: {db.tag_name}"
+                            break
+                        elif pos_in_blk // 16 < block_offset < (pos_in_blk + db_size) // 16:
+                            if db.is_timing:
+                                t = db.parse_timing()
+                                if t:
+                                    marker = f"  ← {t.h_active}×{t.v_active} @ {t.refresh_rate:.1f}Hz"
+                            break
+                        pos_in_blk += db_size
+                elif info.get('parsed') and info.get('ceadata'):
+                    cea2 = info['ceadata']
+                    if cea2 and block_offset == 4:
+                        marker = f"  ← Data Block Collection (end at {cea2.dtd_offset})"
+                    elif cea2 and block_offset * 16 >= cea2.dtd_offset:
+                        marker = "  ← CEA DTD area"
 
             addr_str = f"{block_num:1d}:{block_offset:04X}" if block_num > 0 else f"{offset:04X}"
             lines.append(f"{addr_str}  {hex_part:<48s}  {ascii_part}{marker}")
@@ -1441,78 +1497,157 @@ class EDIDEditorApp:
     # CEA-861 扩展操作
     # ==================================================================
     def _refresh_cea_tab(self):
-        """刷新 CEA-861 扩展标签页"""
+        """刷新 CEA-861 / DisplayID 扩展标签页"""
         cea = self.edid.cea_extension if self.edid else None
-        if cea is None:
-            self.cea_status_var.set("无 CEA-861 扩展块 — 点击「创建/重置 CEA-861 扩展」添加")
-            self.cea_rev_var.set("—")
-            self.cea_underscan_var.set("—"); self.cea_audio_var.set("—")
+        did = self.edid.displayid_extension if self.edid else None
+        has_did_blk1 = did is not None and self.edid.block_count >= 2 and self.edid._blocks[1][0] == 0x70
+
+        # ── 清空所有子控件 ──
+        self.cea_db_text.config(state=tk.NORMAL); self.cea_db_text.delete('1.0', tk.END)
+        self.cea_db_text.config(state=tk.DISABLED)
+        self.cea_hdmi_text.config(state=tk.NORMAL); self.cea_hdmi_text.delete('1.0', tk.END)
+        self.cea_hdmi_text.config(state=tk.DISABLED)
+        self.cea_audio_text.config(state=tk.NORMAL); self.cea_audio_text.delete('1.0', tk.END)
+        self.cea_audio_text.config(state=tk.DISABLED)
+        self._clear_cea_dtd_display()
+        self._clear_cea_svd_display()
+
+        if cea is None and not has_did_blk1 and self.edid.block_count < 3:
+            self.cea_status_var.set("无扩展块 — 点击「创建/重置 CEA-861 扩展」添加")
+            self.cea_rev_var.set("—"); self.cea_underscan_var.set("—"); self.cea_audio_var.set("—")
             self.cea_ycbcr444_var.set("—"); self.cea_ycbcr422_var.set("—")
             self.cea_native_var.set("—"); self.cea_cs_var.set("—")
-            self.cea_db_text.config(state=tk.NORMAL); self.cea_db_text.delete('1.0', tk.END)
-            self.cea_db_text.config(state=tk.DISABLED)
-            self.cea_hdmi_text.config(state=tk.NORMAL); self.cea_hdmi_text.delete('1.0', tk.END)
-            self.cea_hdmi_text.config(state=tk.DISABLED)
-            self.cea_audio_text.config(state=tk.NORMAL); self.cea_audio_text.delete('1.0', tk.END)
-            self.cea_audio_text.config(state=tk.DISABLED)
-            self._clear_cea_dtd_display()
-            self._clear_cea_svd_display()
             return
 
-        self.cea_status_var.set(f"CEA-861 扩展块 (版本 {cea.revision}, "
-                                f"{len(cea.data_blocks)} 个数据块, {len(cea.dtds)} 个 DTD)")
+        # ── CEA-861 Block 1 显示 ──
+        if cea is not None:
+            self.cea_status_var.set(f"CEA-861 扩展块 (版本 {cea.revision}, "
+                                    f"{len(cea.data_blocks)} 个数据块, {len(cea.dtds)} 个 DTD)")
+            self.cea_rev_var.set(str(cea.revision))
+            self.cea_underscan_var.set("是" if cea.underscan else "否")
+            self.cea_audio_var.set("是" if cea.basic_audio else "否")
+            self.cea_ycbcr444_var.set("是" if cea.ycbcr444 else "否")
+            self.cea_ycbcr422_var.set("是" if cea.ycbcr422 else "否")
+            self.cea_native_var.set(str(cea.native_dtd_count))
+            ok = self.edid.is_checksum_valid(1)
+            self.cea_cs_var.set(f"{'✓' if ok else '✗'} (0x{self.edid._blocks[1][127]:02X})")
 
-        self.cea_rev_var.set(str(cea.revision))
-        self.cea_underscan_var.set("是" if cea.underscan else "否")
-        self.cea_audio_var.set("是" if cea.basic_audio else "否")
-        self.cea_ycbcr444_var.set("是" if cea.ycbcr444 else "否")
-        self.cea_ycbcr422_var.set("是" if cea.ycbcr422 else "否")
-        self.cea_native_var.set(str(cea.native_dtd_count))
+            self.cea_db_text.config(state=tk.NORMAL)
+            self.cea_db_text.insert(tk.END, "═══ CEA-861 Block 1 ═══\n")
+            for i, db in enumerate(cea.data_blocks):
+                self.cea_db_text.insert(tk.END, f"[{i}] {db.tag_name}\n")
+                self.cea_db_text.insert(tk.END, f"    {db.summary}\n\n")
+            self.cea_db_text.config(state=tk.DISABLED)
 
-        ok = self.edid.is_checksum_valid(1)
-        expected = self.edid.calculate_checksum(1)
-        self.cea_cs_var.set(f"{'✓' if ok else '✗'} (0x{self.edid._blocks[1][127]:02X})")
+            self.cea_hdmi_text.config(state=tk.NORMAL)
+            for db in cea.data_blocks:
+                if isinstance(db, VendorDataBlock):
+                    self.cea_hdmi_text.insert(tk.END, f"厂商: {db.vendor_name} | OUI: 0x{db.ieee_oui:06X}\n")
+                    self.cea_hdmi_text.insert(tk.END, f"    {db.summary}\n")
+                    if db.payload:
+                        self.cea_hdmi_text.insert(tk.END,
+                            f"    Raw: {' '.join(f'{b:02X}' for b in db.payload[:32])}\n")
+            if not any(isinstance(db, VendorDataBlock) for db in cea.data_blocks):
+                self.cea_hdmi_text.insert(tk.END, "(无厂商特定数据块)")
+            self.cea_hdmi_text.config(state=tk.DISABLED)
 
-        # Data Blocks 详情
-        self.cea_db_text.config(state=tk.NORMAL)
-        self.cea_db_text.delete('1.0', tk.END)
-        for i, db in enumerate(cea.data_blocks):
-            self.cea_db_text.insert(tk.END, f"[{i}] {db.tag_name}\n")
-            self.cea_db_text.insert(tk.END, f"    {db.summary}\n\n")
-        self.cea_db_text.config(state=tk.DISABLED)
+            self.cea_audio_text.config(state=tk.NORMAL)
+            for db in cea.data_blocks:
+                if isinstance(db, AudioDataBlock):
+                    for af in db.formats:
+                        rates = af.sample_rate_list()
+                        self.cea_audio_text.insert(tk.END,
+                            f"{af.format_name} | {af.max_channels}ch | {', '.join(rates)}\n")
+            if not any(isinstance(db, AudioDataBlock) for db in cea.data_blocks):
+                self.cea_audio_text.insert(tk.END, "(无音频数据块)")
+            self.cea_audio_text.config(state=tk.DISABLED)
 
-        # HDMI VSDB 详情
-        self.cea_hdmi_text.config(state=tk.NORMAL)
-        self.cea_hdmi_text.delete('1.0', tk.END)
-        for db in cea.data_blocks:
-            if isinstance(db, VendorDataBlock):
-                self.cea_hdmi_text.insert(tk.END, f"厂商: {db.vendor_name}\n")
-                self.cea_hdmi_text.insert(tk.END, f"OUI: 0x{db.ieee_oui:06X}\n")
-                self.cea_hdmi_text.insert(tk.END, f"Summary: {db.summary}\n")
-                if db.payload:
-                    self.cea_hdmi_text.insert(tk.END, f"Raw: {' '.join(f'{b:02X}' for b in db.payload[:32])}\n")
-        if not any(isinstance(db, VendorDataBlock) for db in cea.data_blocks):
-            self.cea_hdmi_text.insert(tk.END, "(无厂商特定数据块)")
-        self.cea_hdmi_text.config(state=tk.DISABLED)
+            self._refresh_cea_svd_display()
+            self._refresh_cea_dtd_display()
 
-        # Audio 详情
-        self.cea_audio_text.config(state=tk.NORMAL)
-        self.cea_audio_text.delete('1.0', tk.END)
-        for db in cea.data_blocks:
-            if isinstance(db, AudioDataBlock):
-                for af in db.formats:
-                    rates = af.sample_rate_list()
-                    self.cea_audio_text.insert(tk.END,
-                        f"{af.format_name} | {af.max_channels}ch | {', '.join(rates)}\n")
-        if not any(isinstance(db, AudioDataBlock) for db in cea.data_blocks):
-            self.cea_audio_text.insert(tk.END, "(无音频数据块 — Basic Audio 可能关闭)")
-        self.cea_audio_text.config(state=tk.DISABLED)
+        # ── DisplayID 扩展 (Block 1, tag 0x70) ──
+        if has_did_blk1:
+            self.cea_status_var.set(f"DisplayID 扩展块 (v1.{did.revision>>4}{did.revision&0x0F}, "
+                                    f"{len(did.data_blocks)} 个数据块)")
+            self.cea_db_text.config(state=tk.NORMAL)
+            self.cea_db_text.insert(tk.END, "═══ DisplayID Extension (Block 1) ═══\n")
+            self.cea_db_text.insert(tk.END,
+                f"版本: DisplayID 1.{did.revision>>4}{did.revision&0x0F} | "
+                f"{len(did.data_blocks)} 个数据块\n")
+            t_count = sum(1 for db in did.data_blocks if db.is_timing)
+            self.cea_db_text.insert(tk.END, f"其中详细时序: {t_count} 个\n\n")
+            for i, db in enumerate(did.data_blocks):
+                self.cea_db_text.insert(tk.END, f"[{i}] {db.tag_name} ({len(db.payload)}字节)\n")
+                if db.is_timing:
+                    t = db.parse_timing()
+                    if t:
+                        self.cea_db_text.insert(tk.END,
+                            f"    → {t.h_active}×{t.v_active} @ {t.refresh_rate:.1f}Hz "
+                            f"({t.pixel_clock_mhz:.1f}MHz)\n")
+                        self.cea_db_text.insert(tk.END,
+                            f"    H: active={t.h_active} blank={t.h_blanking} "
+                            f"fp={t.h_front_porch} sync={t.h_sync} total={t.h_total}\n")
+                        self.cea_db_text.insert(tk.END,
+                            f"    V: active={t.v_active} blank={t.v_blanking} "
+                            f"fp={t.v_front_porch} sync={t.v_sync} total={t.v_total}\n")
+                else:
+                    self.cea_db_text.insert(tk.END, f"    {db.summary}\n")
+                self.cea_db_text.insert(tk.END, "\n")
+            self.cea_db_text.config(state=tk.DISABLED)
 
-        # SVD 显示
-        self._refresh_cea_svd_display()
+        # ── Block 2 信息 (通用) ──
+        if self.edid.block_count >= 3:
+            info = self.edid.ext2_info
+            self.cea_db_text.config(state=tk.NORMAL)
+            self.cea_db_text.insert(tk.END, "═══ Block 2 — 扩展块 2 ═══\n")
+            self.cea_db_text.insert(tk.END, f"标签: {info.get('tag_name', '?')} "
+                                     f"(0x{info.get('tag', 0):02X})\n")
 
-        # CEA DTD 显示
-        self._refresh_cea_dtd_display()
+            did2 = info.get('displayid')
+            if did2 is not None:
+                self.cea_db_text.insert(tk.END,
+                    f"版本: DisplayID 1.{did2.revision>>4}{did2.revision&0x0F} | "
+                    f"{len(did2.data_blocks)} 个标准数据块\n")
+                t_count = sum(1 for db in did2.data_blocks if db.is_timing)
+                if t_count:
+                    self.cea_db_text.insert(tk.END, f"其中标准详细时序: {t_count} 个\n")
+                ok2 = self.edid.is_checksum_valid(2)
+                self.cea_db_text.insert(tk.END,
+                    f"校验和: {'✓' if ok2 else '✗'} (0x{self.edid._blocks[2][127]:02X})\n")
+                for i, db in enumerate(did2.data_blocks):
+                    self.cea_db_text.insert(tk.END, f"\n  [{i}] {db.tag_name} ({len(db.payload)}字节)")
+                    if db.is_timing:
+                        t = db.parse_timing()
+                        if t:
+                            self.cea_db_text.insert(tk.END,
+                                f"\n      → {t.h_active}×{t.v_active} @ {t.refresh_rate:.1f}Hz "
+                                f"({t.pixel_clock_mhz:.1f}MHz)")
+                    self.cea_db_text.insert(tk.END, f"\n      {db.summary}\n")
+                # 显示未解析的 vendor raw data
+                vraw = did2.vendor_raw
+                if vraw and len(vraw) > 4:
+                    self.cea_db_text.insert(tk.END,
+                        f"\n  ⚠ 剩余 {len(vraw)} 字节为 Vendor 自定义数据 (非标准 DisplayID):\n")
+                    hex_lines = []
+                    for j in range(0, min(len(vraw), 96), 16):
+                        chunk = vraw[j:j+16]
+                        hex_lines.append('    ' + ' '.join(f'{b:02X}' for b in chunk))
+                    self.cea_db_text.insert(tk.END, '\n'.join(hex_lines) + '\n')
+                    self.cea_db_text.insert(tk.END,
+                        f"    (可能是 RTD Scaler 芯片时序参数，非 EDID 标准格式)\n")
+            elif info.get('parsed') and info.get('ceadata'):
+                cea2 = info['ceadata']
+                self.cea_db_text.insert(tk.END, f"版本: CEA-861 rev {cea2.revision}\n")
+                self.cea_db_text.insert(tk.END, f"数据块: {len(cea2.data_blocks)} | DTDs: {len(cea2.dtds)} | "
+                    f"SVDs: {len(cea2.get_video_svds())}\n")
+                ok2 = self.edid.is_checksum_valid(2)
+                self.cea_db_text.insert(tk.END,
+                    f"校验和: {'✓' if ok2 else '✗'} (0x{self.edid._blocks[2][127]:02X})\n")
+                for i, db in enumerate(cea2.data_blocks):
+                    self.cea_db_text.insert(tk.END, f"\n  [{i}] {db.tag_name}\n      {db.summary}\n")
+            else:
+                self.cea_db_text.insert(tk.END, f"(未解析 — 原始数据)\n")
+            self.cea_db_text.config(state=tk.DISABLED)
 
     def _refresh_cea_svd_display(self):
         """刷新 SVD 列表显示"""
@@ -1640,6 +1775,186 @@ class EDIDEditorApp:
             self._refresh_cea_tab()
             self._refresh_raw()
             self.set_status(f"已删除 CEA DTD #{index}")
+
+    # ── DisplayID 时序编辑 ──────────────────────────────────────────────
+    def _refresh_did_timing_display(self):
+        """刷新 DisplayID 详细时序列表（来自所有 DisplayID 扩展块）"""
+        for w in self.did_timing_frame.winfo_children():
+            w.destroy()
+
+        if self.edid is None:
+            return
+        all_did_timings = []  # [(source_label, block_idx, db_index, db, timing), ...]
+        # Block 1 DisplayID
+        if self.edid.displayid_extension and self.edid._blocks[1][0] == 0x70:
+            did = self.edid.displayid_extension
+            for j, db in enumerate(did.data_blocks):
+                if db.is_timing:
+                    t = db.parse_timing()
+                    if t:
+                        all_did_timings.append(("B1", 1, j, db, t, did))
+        # Block 2 DisplayID
+        if self.edid.block_count >= 3 and self.edid._blocks[2][0] == 0x70:
+            info = self.edid.ext2_info
+            did2 = info.get('displayid')
+            if did2:
+                for j, db in enumerate(did2.data_blocks):
+                    if db.is_timing:
+                        t = db.parse_timing()
+                        if t:
+                            all_did_timings.append(("B2", 2, j, db, t, did2))
+
+        if not all_did_timings:
+            ttk.Label(self.did_timing_frame, text="(无 DisplayID 详细时序)", foreground='gray').pack()
+            return
+
+        for src, blk, db_idx, db, t, did_ref in all_did_timings:
+            row = ttk.Frame(self.did_timing_frame)
+            row.pack(fill=tk.X, pady=1)
+
+            label_text = (f"[{src}] {t.h_active}×{t.v_active} @ {t.refresh_rate:.1f}Hz "
+                          f"({t.pixel_clock_mhz:.1f}MHz) "
+                          f"H={t.h_total} V={t.v_total}")
+            ttk.Label(row, text=label_text, font=('Consolas', 9)).pack(side=tk.LEFT, padx=3)
+
+            ttk.Button(row, text="编辑", width=5,
+                       command=lambda d=db, ref=did_ref, idx=db_idx: self._edit_did_timing(d, ref, idx)
+                       ).pack(side=tk.RIGHT, padx=2)
+            ttk.Button(row, text="删除", width=5,
+                       command=lambda ref=did_ref, idx=db_idx: self._delete_did_timing(ref, idx)
+                       ).pack(side=tk.RIGHT, padx=2)
+
+    def _add_did_timing(self, block2: bool = False):
+        """添加 DisplayID 详细时序数据块"""
+        if self.edid is None:
+            return
+        dlg = TimingEditDialog(self.root, preset_names=self._preset_names)
+        self.root.wait_window(dlg)
+        if not dlg.result:
+            return
+
+        t = dlg.result
+        # 构建 DisplayID Type I payload (20 bytes)
+        pclk = t.pixel_clock
+        payload = bytes([
+            pclk & 0xFF, (pclk >> 8) & 0xFF, (pclk >> 16) & 0xFF, (pclk >> 24) & 0xFF,
+            t.h_active & 0xFF, (t.h_active >> 8) & 0xFF,
+            t.h_blanking & 0xFF,
+            ((t.h_blanking >> 8) & 0x0F) | (((t.h_front_porch >> 8) & 0x0F) << 4),
+            t.h_front_porch & 0xFF,
+            t.h_sync & 0xFF,
+            t.v_active & 0xFF, (t.v_active >> 8) & 0xFF,
+            t.v_blanking & 0xFF,
+            ((t.v_blanking >> 8) & 0x0F) | (((t.v_front_porch >> 8) & 0x0F) << 4),
+            t.v_front_porch & 0xFF,
+            t.v_sync & 0xFF,
+            t.h_image_size & 0xFF, (t.h_image_size >> 8) & 0xFF,
+            t.v_image_size & 0xFF, (t.v_image_size >> 8) & 0xFF,
+        ])
+        db = DisplayIDDataBlock(tag=0x03, revision=1, payload=payload)
+
+        # 确定目标 DisplayID 扩展
+        if block2:
+            # 确保 Block 2 有 DisplayID
+            if self.edid.block_count < 3:
+                self.edid.set_blocks(3)
+            if self.edid._blocks[2][0] != 0x70:
+                did = DisplayIDExtension(revision=0x13)
+                did.data_blocks.append(db)
+                self.edid._blocks[2] = bytearray(did.to_bytes())
+                self.edid._blocks[0][126] = 2
+            else:
+                did = self.edid.ext2_info.get('displayid')
+                if did:
+                    did.data_blocks.append(db)
+                    self.edid._blocks[2] = bytearray(did.to_bytes())
+        else:
+            # Block 1 DisplayID
+            if self.edid.displayid_extension and self.edid._blocks[1][0] == 0x70:
+                did = self.edid.displayid_extension
+                did.data_blocks.append(db)
+                self.edid._blocks[1] = bytearray(did.to_bytes())
+            else:
+                did = DisplayIDExtension(revision=0x13)
+                did.data_blocks.append(db)
+                self.edid._blocks[1] = bytearray(did.to_bytes())
+                if self.edid.block_count < 2:
+                    self.edid.set_blocks(2)
+                self.edid._blocks[0][126] = max(self.edid._blocks[0][126], 1)
+
+        self.edid._parse_extensions()
+        self.edid.update_all_checksums()
+        self._mark_modified()
+        self._refresh_did_timing_display()
+        self._refresh_cea_tab()
+        self._refresh_raw()
+        self.set_status(f"已添加 DisplayID 时序: {t.h_active}×{t.v_active} @ {t.refresh_rate:.1f}Hz")
+
+    def _edit_did_timing(self, db: DisplayIDDataBlock, did_ext: DisplayIDExtension, db_index: int):
+        """编辑 DisplayID 详细时序"""
+        t = db.parse_timing()
+        if not t:
+            return
+        dlg = TimingEditDialog(self.root, t, self._preset_names)
+        self.root.wait_window(dlg)
+        if not dlg.result:
+            return
+
+        new_t = dlg.result
+        pclk = new_t.pixel_clock
+        payload = bytes([
+            pclk & 0xFF, (pclk >> 8) & 0xFF, (pclk >> 16) & 0xFF, (pclk >> 24) & 0xFF,
+            new_t.h_active & 0xFF, (new_t.h_active >> 8) & 0xFF,
+            new_t.h_blanking & 0xFF,
+            ((new_t.h_blanking >> 8) & 0x0F) | (((new_t.h_front_porch >> 8) & 0x0F) << 4),
+            new_t.h_front_porch & 0xFF,
+            new_t.h_sync & 0xFF,
+            new_t.v_active & 0xFF, (new_t.v_active >> 8) & 0xFF,
+            new_t.v_blanking & 0xFF,
+            ((new_t.v_blanking >> 8) & 0x0F) | (((new_t.v_front_porch >> 8) & 0x0F) << 4),
+            new_t.v_front_porch & 0xFF,
+            new_t.v_sync & 0xFF,
+            new_t.h_image_size & 0xFF, (new_t.h_image_size >> 8) & 0xFF,
+            new_t.v_image_size & 0xFF, (new_t.v_image_size >> 8) & 0xFF,
+        ])
+        db.payload = payload
+        db.tag = 0x03
+        db.revision = 1
+
+        # 写回对应 block
+        ext_data = did_ext.to_bytes()
+        for blk_idx in [1, 2]:
+            if blk_idx < len(self.edid._blocks) and self.edid._blocks[blk_idx][0] == 0x70:
+                self.edid._blocks[blk_idx] = bytearray(ext_data)
+                break
+
+        self.edid._parse_extensions()
+        self.edid.update_all_checksums()
+        self._mark_modified()
+        self._refresh_did_timing_display()
+        self._refresh_cea_tab()
+        self._refresh_raw()
+        self.set_status(f"已编辑 DisplayID 时序 #{db_index}")
+
+    def _delete_did_timing(self, did_ext: DisplayIDExtension, db_index: int):
+        """删除 DisplayID 详细时序"""
+        if not messagebox.askyesno("确认", f"确定要删除 DisplayID 时序 #{db_index} 吗？"):
+            return
+        if 0 <= db_index < len(did_ext.data_blocks):
+            did_ext.data_blocks.pop(db_index)
+            # 写回
+            ext_data = did_ext.to_bytes()
+            for blk_idx in [1, 2]:
+                if blk_idx < len(self.edid._blocks) and self.edid._blocks[blk_idx][0] == 0x70:
+                    self.edid._blocks[blk_idx] = bytearray(ext_data)
+                    break
+            self.edid._parse_extensions()
+            self.edid.update_all_checksums()
+            self._mark_modified()
+            self._refresh_did_timing_display()
+            self._refresh_cea_tab()
+            self._refresh_raw()
+            self.set_status(f"已删除 DisplayID 时序 #{db_index}")
 
     def _create_cea(self):
         """创建/重置 CEA-861 扩展"""
@@ -1778,6 +2093,7 @@ class EDIDEditorApp:
         self._refresh_descriptors_ui()
         self._refresh_std_timings()
         self._refresh_cea_tab()
+        self._refresh_did_timing_display()
         self._refresh_raw()
 
     def _mark_modified(self, *args):
